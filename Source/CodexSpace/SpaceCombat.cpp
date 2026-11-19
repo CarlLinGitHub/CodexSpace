@@ -2,9 +2,20 @@
 
 namespace
 {
-constexpr float HalfWidth = 680, HalfHeight = 430;
-constexpr float BossAt = 52;
-constexpr int32 WaveCount = 8;
+struct FSector
+{
+    const TCHAR* Name;
+    float WaveGap, Spacing, Stagger, Sway, Cadence;
+    int32 BossHealth;
+};
+constexpr FSector Sectors[] = {
+    {TEXT("OUTER RIM"),       4.8f, 174.f,  26.f, 0.78f, 1.12f,  44},
+    {TEXT("ASTEROID BELT"),   4.5f, 150.f,  52.f, 1.24f, 1.00f,  66},
+    {TEXT("ION NEBULA"),      4.3f, 146.f, -49.f, 1.40f, 0.94f,  88},
+    {TEXT("SIEGE LINE"),      4.0f, 155.f,  35.f, 0.66f, 0.88f, 114},
+    {TEXT("DREADNOUGHT CORE"),3.8f, 138.f,  41.f, 1.55f, 0.82f, 150},
+};
+static_assert(UE_ARRAY_COUNT(Sectors) == ASpaceGameMode::SectorCount);
 
 FVector Direction(float Degrees)
 {
@@ -14,27 +25,47 @@ FVector Direction(float Degrees)
 }
 }
 
+const TCHAR* ASpaceGameMode::SectorName() const
+{
+    return Sectors[Sector - 1].Name;
+}
+
+void ASpaceGameMode::StartNextSector()
+{
+    ++Sector;
+    Wave = Pattern = BossHP = BossMaxHP = 0;
+    Time = Fire = StepRemainder = 0;
+    Shield = 1.2f;
+    Player = FVector(0, -350, 0);
+    Enemies.Reset();
+    Shots.Reset();
+    PowerUps.Reset();
+    Pulses = FMath::Min(Pulses + 1, 2);
+    State = EState::Playing;
+}
+
+FLinearColor ASpaceGameMode::AmmoTint(EAmmo Color)
+{
+    constexpr FLinearColor Tints[] = {{1.f,.76f,.06f}, {1.f,.12f,.035f}, {.07f,.46f,1.f}};
+    return Tints[static_cast<int32>(Color)];
+}
+
+ASpaceGameMode::EVisual ASpaceGameMode::AmmoVisual(EAmmo Color)
+{
+    return static_cast<EVisual>(static_cast<int32>(EVisual::Yellow) + static_cast<int32>(Color));
+}
+
 void ASpaceGameMode::Advance(float Dt, FVector Move, bool bFire)
 {
     Time += Dt;
     Fire -= Dt;
     Shield -= Dt;
     Player += Move * (bFocus ? 235 : 545) * Dt;
-    Player.X = FMath::Clamp(Player.X, -HalfWidth, HalfWidth);
-    Player.Y = FMath::Clamp(Player.Y, -HalfHeight, HalfHeight);
+    ClampPlayerToView();
     if (bFire && Fire <= 0)
     {
         Fire = bFocus ? .095f : .13f;
-        const float Spread = bFocus ? 0.f : 100.f;
-        Shots.Add({Player + FVector(-16,28,0), FVector(-Spread,1100,0), false});
-        Shots.Add({Player + FVector(16,28,0), FVector(Spread,1100,0), false});
-        if (Power >= 2)
-            Shots.Add({Player + FVector(0,34,0), FVector(0,1210,0), false});
-        if (Power == 3)
-        {
-            Shots.Add({Player + FVector(-26,20,0), FVector(-Spread - 75,1040,0), false});
-            Shots.Add({Player + FVector(26,20,0), FVector(Spread + 75,1040,0), false});
-        }
+        FireVolley();
     }
     EnemiesTick(Dt);
     ShotsTick(Dt);
@@ -42,16 +73,55 @@ void ASpaceGameMode::Advance(float Dt, FVector Move, bool bFire)
     for (int32 Index = PowerUps.Num() - 1; Index >= 0; --Index)
     {
         auto& Pickup = PowerUps[Index];
-        Pickup.Y -= 122 * Dt;
-        if (FVector::DistSquared2D(Player, Pickup) < FMath::Square(39))
+        Pickup.Pos.Y -= 122 * Dt;
+        if (FVector::DistSquared2D(Player, Pickup.Pos) < FMath::Square(39))
         {
-            Power = FMath::Min(Power + 1, 3);
+            if (ActiveAmmo != Pickup.Color)
+            {
+                for (auto& Level : AmmoLevels) Level = 0;
+                ActiveAmmo = Pickup.Color;
+            }
+            auto& Level = AmmoLevels[static_cast<int32>(ActiveAmmo)];
+            Level = FMath::Min(Level + 1, MaxAmmoLevel);
             Score += 250;
-            Burst(Pickup, 12);
+            Burst(Pickup.Pos, 12);
             PowerUps.RemoveAtSwap(Index, EAllowShrinking::No);
         }
-        else if (Pickup.Y < -520) PowerUps.RemoveAtSwap(Index, EAllowShrinking::No);
+        else if (Pickup.Pos.Y < ProjectileY.X) PowerUps.RemoveAtSwap(Index, EAllowShrinking::No);
     }
+}
+
+void ASpaceGameMode::FireVolley()
+{
+    struct FProfile { float SpreadPerLevel; int32 DamagePerLevel; };
+    constexpr FProfile Profiles[] = {{7.f, 0}, {2.f, 3}, {4.f, 1}};
+    static_assert(UE_ARRAY_COUNT(Profiles) == static_cast<int32>(EAmmo::Count));
+    const int32 Index = static_cast<int32>(ActiveAmmo);
+    const auto& Profile = Profiles[Index];
+    const int32 Level = AmmoLevels[Index];
+    const int32 Damage = 1 + Level * Profile.DamagePerLevel;
+    const float AngleStep = Profile.SpreadPerLevel * (bFocus ? .67f : 1.f);
+    const FVector Muzzle = Player + FVector(0, 45, 10);
+    const uint32 Volley = ++VolleyId;
+    for (int32 Lane = -Level; Lane <= Level; ++Lane)
+        Shots.Add({Muzzle, Direction(180.f - Lane * AngleStep) * 1150, false, ActiveAmmo, Damage, Volley});
+}
+
+bool ASpaceGameMode::FEnemy::RegisterHit(uint32 Volley)
+{
+    // Active shots leave the arena in under two seconds; 64 volley IDs cover their lifetime.
+    if (Volley > LatestVolley)
+    {
+        const uint32 Delta = Volley - LatestVolley;
+        VolleyHits = Delta < 64 ? VolleyHits << Delta : 0;
+        LatestVolley = Volley;
+    }
+    const uint32 VolleyAge = LatestVolley - Volley;
+    if (VolleyAge >= 64) return false;
+    const uint64 Bit = uint64(1) << VolleyAge;
+    if (VolleyHits & Bit) return false;
+    VolleyHits |= Bit;
+    return true;
 }
 
 void ASpaceGameMode::Pulse()
@@ -70,22 +140,25 @@ void ASpaceGameMode::Pulse()
 
 void ASpaceGameMode::EnemiesTick(float Dt)
 {
-    if (Wave < WaveCount && Time >= 1.2f + Wave * 6.0f)
+    const auto& Profile = Sectors[Sector - 1];
+    if (Wave < WavesPerSector && Time >= 1.2f + Wave * Profile.WaveGap)
     {
-        const int32 Count = 4 + Wave % 3;
+        const int32 Count = FMath::Min(4 + (Wave + Sector - 1) % 3 + (Sector >= 4), 7);
         for (int32 Index = 0; Index < Count; ++Index)
         {
-            const float X = (Index - (Count - 1) * .5f) * 176;
-            const int32 Heavy = Wave >= 2 && (Index + Wave) % 3 == 0;
-            Enemies.Add({FVector(X, 560 + (Index % 2) * 52, 0), X, 0, .95f + Index * .23f, Heavy ? 7 : 3, Heavy});
+            const float Slot = Index - (Count - 1) * .5f;
+            const float Shift = Sector == 3 ? (Wave % 2 ? 130.f : -130.f) : 0.f;
+            const float X = Slot * Profile.Spacing + Shift;
+            const int32 Heavy = Wave + Sector >= 4 && (Index + Wave) % (Sector >= 4 ? 2 : 3) == 0;
+            Enemies.Add({FVector(X, 560 + Profile.Stagger * FMath::Abs(Slot), 0), X, 0, .85f + Index * .20f, Heavy ? 7 : 3, Heavy});
         }
         ++Wave;
     }
-    if (Time >= BossAt && Wave == WaveCount)
+    if (Time >= 2.2f + WavesPerSector * Profile.WaveGap && Wave == WavesPerSector)
     {
-        Wave++;
-        BossHP = MaxBossHP;
-        Enemies.Add({FVector(0,600,0), 0, 0, 1.5f, MaxBossHP, 2});
+        ++Wave;
+        BossHP = BossMaxHP = Profile.BossHealth;
+        Enemies.Add({FVector(0,600,0), 0, 0, 1.5f, BossHP, 2});
     }
     for (int32 Index = Enemies.Num() - 1; Index >= 0; --Index)
     {
@@ -100,9 +173,9 @@ void ASpaceGameMode::EnemiesTick(float Dt)
         else
         {
             Enemy.Pos.Y -= (Enemy.Kind == 1 ? 133 : 205) * Dt;
-            Enemy.Pos.X = Enemy.StartX + (Enemy.Kind == 1 ? 70 : 150) * FMath::Sin(Enemy.Age * 1.7f + Enemy.StartX * .004f);
+            Enemy.Pos.X = Enemy.StartX + Profile.Sway * (Enemy.Kind == 1 ? 70 : 130) * FMath::Sin(Enemy.Age * 1.7f + Enemy.StartX * .004f);
         }
-        if (Enemy.Pos.Y < -530)
+        if (Enemy.Pos.Y < ProjectileY.X)
         {
             Enemies.RemoveAtSwap(Index, EAllowShrinking::No);
             continue;
@@ -113,25 +186,37 @@ void ASpaceGameMode::EnemiesTick(float Dt)
         const FVector Aim = (Player - Origin).GetSafeNormal();
         if (bBoss)
         {
-            const bool bRage = Enemy.HP <= MaxBossHP / 2;
-            Enemy.Cooldown = bRage ? .38f : .59f;
+            const bool bRage = Enemy.HP <= BossMaxHP / 2;
+            Enemy.Cooldown = (bRage ? .58f : .87f) * Profile.Cadence;
             ++Pattern;
-            if (Pattern % 3 == 0)
+            const auto Fan = [&](FVector Source, FVector Heading, int32 Wings, float Step, float Speed)
             {
-                const int32 Count = bRage ? 22 : 15;
-                for (int32 I = 0; I < Count; ++I)
-                    Shots.Add({Origin, Direction(360.f * I / Count + Pattern * 13.f) * (bRage ? 326 : 250), true});
-            }
-            else
-            {
-                const int32 Wings = bRage ? 4 : 2;
                 for (int32 I = -Wings; I <= Wings; ++I)
-                    Shots.Add({Origin, Aim.RotateAngleAxis(I * 13.f, FVector::UpVector) * 400, true});
+                    Shots.Add({Source, Heading.RotateAngleAxis(I * Step, FVector::UpVector) * Speed, true});
+            };
+            const auto Ring = [&](int32 Count, float Speed)
+            {
+                for (int32 I = 0; I < Count; ++I)
+                    Shots.Add({Origin, Direction(360.f * I / Count + Pattern * 17.f) * Speed, true});
+            };
+            switch (Sector)
+            {
+            case 1: Fan(Origin, Aim, bRage ? 3 : 1, 18, 320); break;
+            case 2: if ((Pattern & 1) == 0) Ring(bRage ? 16 : 12, 275); else Fan(Origin, Aim, 2, 15, 330); break;
+            case 3: Fan(Origin, Direction(50.f * FMath::Sin(Pattern * .64f)), bRage ? 4 : 2, 12, 340); break;
+            case 4:
+                for (float Side : {-1.f, 1.f})
+                    Fan(Origin + FVector(Side * 54, 0, 0), Direction(Side * 25), bRage ? 3 : 2, 12, 355);
+                break;
+            default:
+                if (Pattern % 3 == 0) Ring(bRage ? 22 : 16, bRage ? 330 : 275);
+                else Fan(Origin, Aim.RotateAngleAxis(Pattern % 2 ? 15 : -15, FVector::UpVector), bRage ? 4 : 3, 13, 390);
+                break;
             }
         }
         else
         {
-            Enemy.Cooldown = Enemy.Kind == 1 ? 1.13f : 1.48f;
+            Enemy.Cooldown = Profile.Cadence * (Enemy.Kind == 1 ? 1.13f : 1.48f);
             const int32 Wings = Enemy.Kind == 1 ? 1 : 0;
             for (int32 I = -Wings; I <= Wings; ++I)
                 Shots.Add({Origin, Aim.RotateAngleAxis(I * 16.f, FVector::UpVector) * 315, true});
@@ -145,14 +230,13 @@ void ASpaceGameMode::ShotsTick(float Dt)
     {
         Burst(Player, 22);
         Shield = 1.55f;
-        Power = FMath::Max(Power - 1, 1);
         if (--Lives == 0) State = EState::Lost;
     };
     for (int32 I = Shots.Num() - 1; I >= 0; --I)
     {
         auto& Shot = Shots[I];
         Shot.Pos += Shot.Vel * Dt;
-        bool bRemove = FMath::Abs(Shot.Pos.X) > 810 || FMath::Abs(Shot.Pos.Y) > 610;
+        bool bRemove = FMath::Abs(Shot.Pos.X) > ProjectileHalfWidth || Shot.Pos.Y < ProjectileY.X || Shot.Pos.Y > ProjectileY.Y;
         if (!bRemove && Shot.bEnemy && Shield <= 0 && FVector::DistSquared2D(Player, Shot.Pos) < FMath::Square(bFocus ? 11 : 16))
         {
             HitPlayer();
@@ -165,14 +249,20 @@ void ASpaceGameMode::ShotsTick(float Dt)
                 auto& Enemy = Enemies[J];
                 const float Radius = Enemy.Kind == 2 ? 76 : Enemy.Kind == 1 ? 41 : 30;
                 if (FVector::DistSquared2D(Shot.Pos, Enemy.Pos) > FMath::Square(Radius)) continue;
-                --Enemy.HP;
+                if (!Enemy.RegisterHit(Shot.Volley)) continue;
+                Enemy.HP = FMath::Max(0, Enemy.HP - Shot.Damage);
                 if (Enemy.Kind == 2) BossHP = Enemy.HP;
                 if (Enemy.HP == 0)
                 {
                     Score += Enemy.Kind == 2 ? 5000 : Enemy.Kind == 1 ? 350 : 100;
-                    if (Enemy.Kind != 2 && ++Kills % 4 == 0) PowerUps.Add(Enemy.Pos);
+                    if (Enemy.Kind != 2 && FMath::FRand() < .32f)
+                        PowerUps.Add({Enemy.Pos, static_cast<EAmmo>(FMath::RandHelper(static_cast<int32>(EAmmo::Count)))});
                     Burst(Enemy.Pos, Enemy.Kind == 2 ? 80 : 18);
-                    if (Enemy.Kind == 2 && State == EState::Playing) State = EState::Won;
+                    if (Enemy.Kind == 2)
+                    {
+                        State = Sector == SectorCount ? EState::Won : EState::SectorClear;
+                        Intermission = 2.6f;
+                    }
                     Enemies.RemoveAtSwap(J, EAllowShrinking::No);
                 }
                 else Burst(Shot.Pos, 2);
